@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <queue>
+#include <deque>
 #include <map>
 #include <thread>
 #include <mutex>
@@ -23,17 +24,35 @@
 
 Estimator estimator;
 
-queue<sensor_msgs::msg::Imu::ConstPtr> imu_buf;
+std::mutex m_buf;
+sensor_msgs::msg::Imu::ConstPtr latest_measured_msg = nullptr;
+sensor_msgs::msg::Imu::ConstPtr prev_measured_msg = nullptr;
+
+deque<sensor_msgs::msg::Imu::ConstPtr> imu_buf;
 queue<sensor_msgs::msg::PointCloud::ConstPtr> feature_buf;
 queue<sensor_msgs::msg::Image::ConstPtr> img0_buf;
 queue<sensor_msgs::msg::Image::ConstPtr> img1_buf;
-std::mutex m_buf;
+
+bool is_first_imu = true;
+double prev_t = 0.0;            // 이전 메시지 시각 [sec]
+double last_update_t = 0.0;     // 5ms 마다 입력 전달 시각 [sec]
+double update_interval = 0.005; // 업데이트 주기 [sec]
+double input_t = 0.0;           // inputIMU 함수 호출 시각 [sec]
+
+// Kalman filter 관련 변수 선언 및 초기화
+double accl_x_est_ = 0.0; double accl_y_est_ = 0.0; double accl_z_est_ = 0.0;
+double gyro_x_est_ = 0.0; double gyro_y_est_ = 0.0; double gyro_z_est_ = 0.0;
+double accl_x_P_ = 1.0; double accl_y_P_ = 1.0; double accl_z_P_ = 1.0;
+double gyro_x_P_ = 1.0; double gyro_y_P_ = 1.0; double gyro_z_P_ = 1.0;
+double accl_Q_ = 0.00000009; double gyro_Q_ = 0.0001;       
+double accl_R_ = 0.000064; double gyro_R_ = 0.01;
+bool kf_accel_updated_ = false;
+bool kf_gyro_updated_ = false;
 
 // header: 1403715278
 void img0_callback(const sensor_msgs::msg::Image::SharedPtr img_msg)
 {
     m_buf.lock();
-    // std::cout << "Left : " << img_msg->header.stamp.sec << "." << img_msg->header.stamp.nanosec << endl;
     img0_buf.push(img_msg);
     m_buf.unlock();
 }
@@ -140,22 +159,188 @@ void sync_process()
 }
 
 
+sensor_msgs::msg::Imu CreateInterpolatedImu(const sensor_msgs::msg::Imu::SharedPtr first_lattest_msg, const sensor_msgs::msg::Imu::SharedPtr second_lattest_msg, const double alpha)
+{
+    sensor_msgs::msg::Imu imu_msg;
+    return imu_msg;
+}
+
 void imu_callback(const sensor_msgs::msg::Imu::SharedPtr imu_msg)
 {
-    // std::cout << "IMU cb" << std::endl;
+    // --- 이상치 주기(ex. 2, 3, 10ms)로 들어올시 kalman filter 이용한 반복적 예측을 위해 마지막 output 저장 ---
+    static Vector3d last_pred_acc;
+    static Vector3d last_pred_gyr;
+    // --- 이상치 주기(ex. 2, 3, 10ms)로 들어올시 처음에 측정된 IMU 이용해서 예측값 산출하기 위해 저장 ---
+    sensor_msgs::msg::Imu::ConstPtr kf_input_msg = nullptr;
 
-    double t = imu_msg->header.stamp.sec + imu_msg->header.stamp.nanosec * (1e-9);
-    double dx = imu_msg->linear_acceleration.x;
-    double dy = imu_msg->linear_acceleration.y;
-    double dz = imu_msg->linear_acceleration.z;
-    double rx = imu_msg->angular_velocity.x;
-    double ry = imu_msg->angular_velocity.y;
-    double rz = imu_msg->angular_velocity.z;
-    Vector3d acc(dx, dy, dz);
-    Vector3d gyr(rx, ry, rz);
+    // 최신 메시지 저장
+    latest_measured_msg = imu_msg;
 
-    // std::cout << "got t_imu: " << std::fixed << t << endl;
-    estimator.inputIMU(t, acc, gyr);
+    // --- 타임스탬프 계산 ---
+    double t = imu_msg->header.stamp.sec + imu_msg->header.stamp.nanosec * 1e-9;
+    double diff_measured_t = (prev_t > 0.0) ? t - prev_t : 0.0;
+    double diff_measured_t_rounded = std::round(diff_measured_t * 1000.0) / 1000.0;
+    
+    // 디버그 출력
+    std::cout << std::fixed << "prev_t: " << prev_t << std::endl;
+    std::cout << std::fixed << "t: " << t << std::endl;
+    std::cout << "diff_measured_t_rounded: " << diff_measured_t_rounded << std::endl;
+
+    // 현재 타임스탬프를 저장
+    prev_t = t;
+    
+    // --- inputIMU 함수에 전달할 입력 변수들 ---
+    Vector3d input_acc;
+    Vector3d input_gyr;
+
+    // Case 1. 첫 번째 메세지인 경우: 일단 전달
+    if (is_first_imu)
+    {
+        // inputIMU 함수 전달 인자 초기화
+        input_t = t;
+        input_acc = Vector3d(imu_msg->linear_acceleration.x,
+                             imu_msg->linear_acceleration.y,
+                             imu_msg->linear_acceleration.z);
+        input_gyr = Vector3d(imu_msg->angular_velocity.x,
+                             imu_msg->angular_velocity.y,
+                             imu_msg->angular_velocity.z);
+        
+        //마지막 inputIMU 전달인자 업데이트
+        last_pred_acc = input_acc;
+        last_pred_gyr = input_gyr;
+        // 5ms 마다 입력 전달 시각 업데이트
+        last_update_t = input_t;
+
+        // estimator.inputIMU(input_t, input_acc, input_gyr);
+        std::cout << "input_t: " << input_t << std::endl;
+        std::cout << "t - last_update_t: " << t - last_update_t << std::endl;
+        std::cout << "-------------------------------------------" << std::endl;
+
+        is_first_imu = false;
+    }
+    else
+    {
+        // Case 2. 첫번째 이후, 구독 주기가 4ms 이상 6ms 이하인 경우
+        if (diff_measured_t_rounded >= 0.004 && diff_measured_t_rounded <= 0.006)
+        {   
+            // 5ms 마다 subscribe한 IMU 토픽 데이터를 inputIMU 함수에 전달
+            input_t = last_update_t + update_interval;
+            input_acc = Vector3d(latest_measured_msg->linear_acceleration.x,
+                                latest_measured_msg->linear_acceleration.y,
+                                latest_measured_msg->linear_acceleration.z);
+            input_gyr = Vector3d(latest_measured_msg->angular_velocity.x,
+                                latest_measured_msg->angular_velocity.y,
+                                latest_measured_msg->angular_velocity.z);
+
+            // estimator.inputIMU(input_t, input_acc, input_gyr);
+
+            //마지막 inputIMU 전달인자 업데이트
+            last_pred_acc = input_acc;
+            last_pred_gyr = input_gyr;
+            // 5ms 마다 입력 전달 시각 업데이트
+            last_update_t = input_t;
+
+            std::cout << "input_t: " << input_t << std::endl;
+            std::cout << "t - last_update_t: " << t - last_update_t << std::endl;
+            std::cout << "-------------------------------------------" << std::endl;
+
+        }
+        // Case 3. 이상치 주기(ex. 2, 3, 10ms)로 다음 IMU 토픽 subscribe한 경우
+        else
+        {
+            // 현재 타임스탬프에서 5ms 만큼 더한 시각을 input_t로 설정
+            input_t = last_update_t + update_interval;
+
+            // 현재 시각과 마지막 업데이트 시각의 차이 계산
+            double dt = t - input_t;
+            double dt_rounded = std::round(dt * 1000.0) / 1000.0;
+            std::cout << "dt_rounded: " << dt_rounded << std::endl;
+            std :: cout << "t: " << t << std::endl;
+            std :: cout << "input_t: " << input_t << std::endl;
+            while ((std::abs(dt_rounded) >= 0.005) && (t > input_t))
+            {   
+                
+                std::cout << "루프 안" << std::endl;
+                // // 업데이트 시각 결정 (마지막 업데이트 시각 + 5ms)
+                // input_t = last_update_t + update_interval;
+
+                if (!kf_input_msg)
+                {
+                    std::cout << "여기서 kalman filter 적용 (새로운 메시지 사용)" << std::endl;
+                    kf_input_msg = prev_measured_msg;
+
+                    // ====== 아래에서는 12ms 시점 측정된 IMU 이용해서 17ms 시점 예측값을 input으로 활용 ========
+                    // kf_input_acc = Vector3d(kf_input_msg->linear_acceleration.x,
+                    //                     kf_input_msg->linear_acceleration.y,
+                    //                     kf_input_msg->linear_acceleration.z);
+                    // kf_input_gyr = Vector3d(kf_input_msg->angular_velocity.x,
+                    //                     kf_input_msg->angular_velocity.y,
+                    //                     kf_input_msg->angular_velocity.z);
+                    // input_acc = kalman_filter(kf_input_acc);
+                    // input_gyr = kalman_filter(kf_input_gyr);
+                    input_acc = Vector3d(kf_input_msg->linear_acceleration.x,
+                                        kf_input_msg->linear_acceleration.y,
+                                        kf_input_msg->linear_acceleration.z);
+                    input_gyr = Vector3d(kf_input_msg->angular_velocity.x,
+                                        kf_input_msg->angular_velocity.y,
+                                        kf_input_msg->angular_velocity.z);
+                }
+                else
+                {
+                    // ====== 아래에서는 17ms 시점 예측된 IMU 이용해서 22ms 시점 예측값을 input으로 활용 ========
+                    std::cout << "여기서 kalman filter 적용 (이전 예측값 사용)" << std::endl;
+                    // // 이전 예측값을 그대로 사용하여 예측을 반복.
+                    // // 여기서 Kalman filter를 적용하여 input_t 시점의 예측값 산출 (예: 예측 결과가 input_acc, input_gyr에 저장)
+                    // input_acc = kalman_filter(last_pred_acc);
+                    // input_gyr = kalman_filter(last_pred_gyr);
+                    input_acc = last_pred_acc;
+                    input_gyr = last_pred_gyr;
+                }
+                
+                // 5ms 간격마다 estimator.inputIMU() 호출
+                // estimator.inputIMU(input_t, input_acc, input_gyr);
+
+                // 다음 시점의 KF 입력으로 사용하기 위해 갱신
+                last_pred_acc = input_acc;
+                last_pred_gyr = input_gyr;
+                last_update_t = input_t;
+                
+                input_t = last_update_t + update_interval;
+
+                // 남은 시간 재계산
+                dt = t - input_t;
+                dt_rounded = std::round(dt * 1000.0) / 1000.0;
+            }
+            std::cout << "루프 밖" << std::endl;
+            if (std::abs(dt_rounded) < 0.005)
+            // if (!((std::abs(dt_rounded) >= 0.005) && (t > input_t)))
+            {
+                
+                std::cout << "루프 밖 조건 만족" << std::endl;
+                // input_acc = Vector3d(latest_measured_msg->linear_acceleration.x,
+                //                     latest_measured_msg->linear_acceleration.y,
+                //                     latest_measured_msg->linear_acceleration.z);
+                // input_gyr = Vector3d(latest_measured_msg->angular_velocity.x,
+                //                     latest_measured_msg->angular_velocity.y,
+                //                     latest_measured_msg->angular_velocity.z);
+
+                // estimator.inputIMU(input_t, input_acc, input_gyr);
+
+                //마지막 inputIMU 전달인자 업데이트
+                last_pred_acc = input_acc;
+                last_pred_gyr = input_gyr;
+                // 5ms 마다 입력 전달 시각 업데이트
+                last_update_t = input_t;
+
+                std::cout << "input_t: " << input_t << std::endl;
+                std::cout << "t - last_update_t: " << t - last_update_t << std::endl;
+                std::cout << "-------------------------------------------" << std::endl;
+            }
+        }
+    }
+
+    prev_measured_msg = latest_measured_msg;  
+
     return;
 }
 
@@ -261,15 +446,19 @@ int main(int argc, char **argv)
     ROS_DEBUG("EIGEN_DONT_PARALLELIZE");
 #endif
 
-    ROS_WARN("waiting for image and imu...");
-
+    ROS_WARN("waiting for image and imu...");    
+    // Publisher
     registerPub(n);
 
+    rclcpp::QoS qos(rclcpp::KeepLast(5000)); 
+    qos.reliable();
+    // qos.best_effort();
 
+    // Subscriber
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu = NULL;
     if(USE_IMU)
-    {
-        sub_imu = n->create_subscription<sensor_msgs::msg::Imu>(IMU_TOPIC, rclcpp::QoS(rclcpp::KeepLast(2000)), imu_callback);
+    {   
+        sub_imu = n->create_subscription<sensor_msgs::msg::Imu>(IMU_TOPIC, qos, imu_callback);
     }
     auto sub_feature = n->create_subscription<sensor_msgs::msg::PointCloud>("/feature_tracker/feature", rclcpp::QoS(rclcpp::KeepLast(2000)), feature_callback);
     auto sub_img0 = n->create_subscription<sensor_msgs::msg::Image>(IMAGE0_TOPIC, rclcpp::QoS(rclcpp::KeepLast(100)), img0_callback);
